@@ -1,10 +1,3 @@
-/**
- * AngularUI - The companion suite for AngularJS
- * @version v0.4.0 - 2013-02-15
- * @link http://angular-ui.github.com
- * @license MIT License, http://www.opensource.org/licenses/MIT
- */
-
 
 angular.module('ui.config', []).value('ui.config', {});
 angular.module('ui.filters', ['ui.config']);
@@ -529,9 +522,9 @@ angular.module('ui.directives').factory('keypressHelper', ['$parse', function ke
     // Check only matching of pressed keys one of the conditions
     elm.bind(mode, function (event) {
       // No need to do that inside the cycle
-      var altPressed = event.metaKey || event.altKey;
-      var ctrlPressed = event.ctrlKey;
-      var shiftPressed = event.shiftKey;
+      var altPressed = !!(event.metaKey || event.altKey);
+      var ctrlPressed = !!event.ctrlKey;
+      var shiftPressed = !!event.shiftKey;
       var keyCode = event.keyCode;
 
       // normalize keycodes
@@ -542,11 +535,11 @@ angular.module('ui.directives').factory('keypressHelper', ['$parse', function ke
       // Iterate over prepared combinations
       angular.forEach(combinations, function (combination) {
 
-        var mainKeyPressed = (combination.keys[keysByCode[event.keyCode]] || combination.keys[event.keyCode.toString()]) || false;
+        var mainKeyPressed = combination.keys[keysByCode[event.keyCode]] || combination.keys[event.keyCode.toString()];
 
-        var altRequired = combination.keys.alt || false;
-        var ctrlRequired = combination.keys.ctrl || false;
-        var shiftRequired = combination.keys.shift || false;
+        var altRequired = !!combination.keys.alt;
+        var ctrlRequired = !!combination.keys.ctrl;
+        var shiftRequired = !!combination.keys.shift;
 
         if (
           mainKeyPressed &&
@@ -718,44 +711,397 @@ angular.module('ui.directives').directive('uiKeyup', ['keypressHelper', function
 
 })();
 /*
- Attaches jquery-ui input mask onto input element
+ Attaches input mask onto input element
  */
 angular.module('ui.directives').directive('uiMask', [
   function () {
+    var maskDefinitions = {
+      '9': /\d/,
+      'A': /[a-zA-Z]/,
+      '*': /[a-zA-Z0-9]/
+    };
     return {
-      require:'ngModel',
-      link:function ($scope, element, attrs, controller) {
+      priority: 100,
+      require: 'ngModel',
+      restrict: 'A',
+      link: function (scope, iElement, iAttrs, controller) {
+        var maskProcessed = false, eventsBound = false,
+            maskCaretMap, maskPatterns, maskPlaceholder,
+            value, valueMasked, isValid,
+            // Vars for initializing/uninitializing
+            originalPlaceholder = iAttrs.placeholder,
+            originalMaxlength   = iAttrs.maxlength,
+            // Vars used exclusively in eventHandler()
+            oldValue, oldValueUnmasked, oldCaretPosition, oldSelectionLength;
 
-        /* We override the render method to run the jQuery mask plugin
-         */
-        controller.$render = function () {
-          var value = controller.$viewValue || '';
-          element.val(value);
-          element.mask($scope.$eval(attrs.uiMask));
-        };
+        iAttrs.$observe('uiMask', initialize);
+        controller.$formatters.push(formatter);
+        controller.$parsers.push(parser);
 
-        /* Add a parser that extracts the masked value into the model but only if the mask is valid
-         */
-        controller.$parsers.push(function (value) {
-          //the second check (or) is only needed due to the fact that element.isMaskValid() will keep returning undefined
-          //until there was at least one key event
-          var isValid = element.isMaskValid() || angular.isUndefined(element.isMaskValid()) && element.val().length>0;
+        function initialize(maskAttr) {
+          if (!angular.isDefined(maskAttr))
+            return uninitialize();
+          processRawMask(maskAttr);
+          if (!maskProcessed)
+            return uninitialize();
+          initializeElement();
+          bindEventListeners();
+        }
+
+        function uninitialize() {
+          maskProcessed = false;
+          unbindEventListeners();
+
+          if (angular.isDefined(originalPlaceholder))
+            iElement.attr('placeholder', originalPlaceholder);
+          else
+            iElement.removeAttr('placeholder');
+
+          if (angular.isDefined(originalMaxlength))
+            iElement.attr('maxlength', originalMaxlength);
+          else
+            iElement.removeAttr('maxlength');
+
+          iElement.val(controller.$modelValue);
+          controller.$viewValue = controller.$modelValue;
+          return false;
+        }
+
+        function initializeElement() {
+          value       = oldValueUnmasked = unmaskValue(controller.$modelValue || '');
+          valueMasked = oldValue         = maskValue(value);
+          isValid     = validateValue(value);
+          viewValue   = isValid && value.length ? valueMasked : '';
+          if (iAttrs.maxlength) // Double maxlength to allow pasting new val at end of mask
+            iElement.attr('maxlength', maskCaretMap[maskCaretMap.length-1]*2);
+          iElement.attr('placeholder', maskPlaceholder);
+          iElement.val(viewValue);
+          controller.$viewValue = viewValue;
+          // Not using $setViewValue so we don't clobber the model value and dirty the form
+          // without any kind of user interaction.
+        }
+
+        function bindEventListeners() {
+          if (eventsBound)
+            return true;
+          iElement.bind('blur',              blurHandler);
+          iElement.bind('mousedown mouseup', mouseDownUpHandler);
+          iElement.bind('input keyup click', eventHandler);
+          eventsBound = true;
+        }
+
+        function unbindEventListeners() {
+          if (!eventsBound)
+            return true;
+          iElement.unbind('blur',      blurHandler);
+          iElement.unbind('mousedown', mouseDownUpHandler);
+          iElement.unbind('mouseup',   mouseDownUpHandler);
+          iElement.unbind('input',     eventHandler);
+          iElement.unbind('keyup',     eventHandler);
+          iElement.unbind('click',     eventHandler);
+          eventsBound = false;
+        }
+
+        function formatter(fromModelValue) {
+          if (!maskProcessed)
+            return fromModelValue;
+          value   = unmaskValue(fromModelValue || '');
+          isValid = validateValue(value);
           controller.$setValidity('mask', isValid);
-          return isValid ? value : undefined;
-        });
+          return isValid ? maskValue(value) : undefined;
+        }
 
-        /* When keyup, update the view value
-         */
-        element.bind('keyup', function () {
-          $scope.$apply(function () {
-            controller.$setViewValue(element.mask());
+        function parser(fromViewValue) {
+          if (!maskProcessed)
+            return fromViewValue;
+          value     = unmaskValue(fromViewValue || '');
+          isValid   = validateValue(value);
+          viewValue = value.length ? maskValue(value) : '';
+          // We have to set viewValue manually as the reformatting of the input
+          // value performed by eventHandler() doesn't happen until after
+          // this parser is called, which causes what the user sees in the input
+          // to be out-of-sync with what the controller's $viewValue is set to.
+          controller.$viewValue = viewValue;
+          controller.$setValidity('mask', isValid);
+          if (value === '' && controller.$error.required !== undefined)
+            controller.$setValidity('required', false);
+          return isValid ? value : undefined;
+        }
+
+        function validateValue(value) {
+          // Zero-length value validity is ngRequired's determination
+          return value.length ? value.length === maskCaretMap.length - 1 : true;
+        }
+
+        function unmaskValue(value) {
+          var valueUnmasked    = '',
+              maskPatternCopys = maskPatterns.slice();
+          angular.forEach(value.toString().split(''), function(chr, i) {
+            if (maskPatternCopys.length && maskPatternCopys[0].test(chr)) {
+              valueUnmasked += chr;
+              maskPatternCopys.shift();
+            }
           });
-        });
+          return valueUnmasked;
+        }
+
+        function maskValue(unmaskedValue) {
+          var valueMasked      = '',
+              maskCaretMapCopy = maskCaretMap.slice();
+          angular.forEach(maskPlaceholder.split(''), function(chr, i) {
+            if (unmaskedValue.length && i === maskCaretMapCopy[0]) {
+              valueMasked  += unmaskedValue.charAt(0) || '_';
+              unmaskedValue = unmaskedValue.substr(1);
+              maskCaretMapCopy.shift(); }
+            else
+              valueMasked += chr;
+          });
+          return valueMasked;
+        }
+
+        function processRawMask(mask) {
+          var characterCount = 0;
+          maskCaretMap       = [];
+          maskPatterns       = [];
+          maskPlaceholder    = '';
+
+          // If mask is an array, it's a complex mask!
+          if (mask instanceof Array) {
+            angular.forEach(mask, function(item, i) {
+              if (item instanceof RegExp) {
+                maskCaretMap.push(characterCount++);
+                maskPlaceholder += '_';
+                maskPatterns.push(item);
+              }
+              else if (typeof item == 'string') {
+                angular.forEach(item.split(''), function(chr, i) {
+                  maskPlaceholder += chr;
+                  characterCount++;
+                });
+              }
+            });
+          }
+          // Otherwise it's a simple mask
+          else if (typeof mask === 'string') {
+            angular.forEach(mask.split(''), function(chr, i) {
+              if (maskDefinitions[chr]) {
+                maskCaretMap.push(characterCount);
+                maskPlaceholder += '_';
+                maskPatterns.push(maskDefinitions[chr]);
+              }
+              else
+                maskPlaceholder += chr;
+              characterCount++;
+            });
+          }
+          // Caret position immediately following last position is valid.
+          maskCaretMap.push(maskCaretMap.slice().pop() + 1);
+          maskProcessed = maskCaretMap.length > 1 ? true : false;
+        }
+
+        function blurHandler(e) {
+          oldCaretPosition   = 0;
+          oldSelectionLength = 0;
+          if (!isValid || value.length === 0) {
+            valueMasked = '';
+            iElement.val('');
+            scope.$apply(function() {
+              controller.$setViewValue('');
+            });
+          }
+        }
+
+        iElement.bind('mousedown mouseup', mouseDownUpHandler);
+
+        function mouseoutHandler(e) {
+          oldSelectionLength = getSelectionLength(this);
+          iElement.unbind('mouseout', mouseoutHandler);
+        }
+
+        function mouseDownUpHandler(e) {
+          if (e.type === 'mousedown')
+            iElement.bind('mouseout', mouseoutHandler);
+          else
+            iElement.unbind('mouseout', mouseoutHandler);
+        }
+
+        function eventHandler(e) {
+          e = e || { which:0, type:'input' };
+          // Allows more efficient minification
+          var eventWhich = e.which,
+              eventType  = e.type;
+
+          // Prevent shift and ctrl from mucking with old values
+          if (eventWhich == 16 || eventWhich == 91) return true;
+
+          var elem            = iElement,
+              val             = elem.val(),
+              valOld          = oldValue,
+              valMasked,
+              valUnmasked     = unmaskValue(val),
+              valUnmaskedOld  = oldValueUnmasked,
+              valAltered      = false,
+
+              caretPos        = getCaretPosition(this) || 0,
+              caretPosOld     = oldCaretPosition || 0,
+              caretPosDelta   = caretPos - caretPosOld,
+              caretPosMin     = maskCaretMap[0],
+              caretPosMax     = maskCaretMap[valUnmasked.length] || maskCaretMap.slice().shift(),
+
+              selectionLen    = getSelectionLength(this),
+              selectionLenOld = oldSelectionLength || 0,
+              isSelected      = selectionLen > 0,
+              wasSelected     = selectionLenOld > 0,
+
+                                                                // Case: Typing a character to overwrite a selection
+              isAddition      = (val.length > valOld.length) || (selectionLenOld && val.length >  valOld.length - selectionLenOld),
+                                                                // Case: Delete and backspace behave identically on a selection
+              isDeletion      = (val.length < valOld.length) || (selectionLenOld && val.length == valOld.length - selectionLenOld),
+              isSelection     = (eventWhich >= 37 && eventWhich <= 40) && e.shiftKey, // Arrow key codes
+
+              isKeyLeftArrow  = eventWhich == 37,
+                                                    // Necessary due to "input" event not providing a key code
+              isKeyBackspace  = eventWhich == 8  || (eventType != 'keyup' && isDeletion && (caretPosDelta === -1)),
+              isKeyDelete     = eventWhich == 46 || (eventType != 'keyup' && isDeletion && (caretPosDelta === 0 ) && !wasSelected),
+
+              // Handles cases where caret is moved and placed in front of invalid maskCaretMap position. Logic below
+              // ensures that, on click or leftward caret placement, caret is moved leftward until directly right of
+              // non-mask character. Also applied to click since users are (arguably) more likely to backspace
+              // a character when clicking within a filled input.
+              caretBumpBack   = (isKeyLeftArrow || isKeyBackspace || eventType == 'click') && caretPos > caretPosMin;
+
+          oldSelectionLength  = selectionLen;
+
+          // These events don't require any action
+          if (isSelection || (isSelected && (eventType == 'click' || eventType == 'keyup')))
+            return true;
+
+          // Value Handling
+          // ==============
+
+          // User attempted to delete but raw value was unaffected--correct this grievous offense
+          if ((eventType == 'input' || eventType == 'propertychange') && isDeletion && !wasSelected && valUnmasked === valUnmaskedOld) {
+            while (isKeyBackspace && caretPos > 0 && !isValidCaretPosition(caretPos))
+              caretPos--;
+            while (isKeyDelete && caretPos < maskPlaceholder.length && maskCaretMap.indexOf(caretPos) == -1)
+              caretPos++;
+            var charIndex = maskCaretMap.indexOf(caretPos);
+            // Strip out non-mask character that user would have deleted if mask hadn't been in the way.
+            valUnmasked = valUnmasked.substring(0, charIndex) + valUnmasked.substring(charIndex + 1);
+            valAltered  = true;
+          }
+
+          // Update values
+          valMasked        = maskValue(valUnmasked);
+          oldValue         = valMasked;
+          oldValueUnmasked = valUnmasked;
+          elem.val(valMasked);
+          if (valAltered) {
+            // We've altered the raw value after it's been $digest'ed, we need to $apply the new value.
+            scope.$apply(function() {
+              controller.$setViewValue(valUnmasked);
+            });
+          }
+
+          // Caret Repositioning
+          // ===================
+
+          // Ensure that typing always places caret ahead of typed character in cases where the first char of
+          // the input is a mask char and the caret is placed at the 0 position.
+          if (isAddition && (caretPos <= caretPosMin))
+            caretPos = caretPosMin + 1;
+
+          if (caretBumpBack)
+            caretPos--;
+
+          // Make sure caret is within min and max position limits
+          caretPos = caretPos > caretPosMax ? caretPosMax : caretPos < caretPosMin ? caretPosMin : caretPos;
+
+          // Scoot the caret back or forth until it's in a non-mask position and within min/max position limits
+          while (!isValidCaretPosition(caretPos) && caretPos > caretPosMin && caretPos < caretPosMax)
+            caretPos += caretBumpBack ? -1 : 1;
+
+          if ((caretBumpBack && caretPos < caretPosMax) || (isAddition && !isValidCaretPosition(caretPosOld)))
+            caretPos++;
+          oldCaretPosition = caretPos;
+          setCaretPosition(this, caretPos);
+        }
+
+        function isValidCaretPosition(pos) { return maskCaretMap.indexOf(pos) > -1; }
+
+        function getCaretPosition(input) {
+          if (input.selectionStart !== undefined)
+            return input.selectionStart;
+          else if (document.selection) {
+            // Curse you IE
+            input.focus();
+            var selection = document.selection.createRange();
+            selection.moveStart('character', -input.value.length);
+            return selection.text.length;
+          }
+        }
+
+        function setCaretPosition(input, pos) {
+          if (input.offsetWidth === 0 || input.offsetHeight === 0)
+            return true; // Input's hidden
+          if (input.setSelectionRange) {
+            input.focus();
+            input.setSelectionRange(pos,pos); }
+          else if (input.createTextRange) {
+            // Curse you IE
+            var range = input.createTextRange();
+            range.collapse(true);
+            range.moveEnd('character', pos);
+            range.moveStart('character', pos);
+            range.select();
+          }
+        }
+
+        function getSelectionLength(input) {
+          if (input.selectionStart !== undefined)
+            return (input.selectionEnd - input.selectionStart);
+          if (document.selection)
+            return (document.selection.createRange().text.length);
+        }
+
+        // https://developer.mozilla.org/en-US/docs/JavaScript/Reference/Global_Objects/Array/indexOf
+        if (!Array.prototype.indexOf) {
+          Array.prototype.indexOf = function (searchElement /*, fromIndex */ ) {
+            "use strict";
+            if (this === null) {
+              throw new TypeError();
+            }
+            var t = Object(this);
+            var len = t.length >>> 0;
+            if (len === 0) {
+              return -1;
+            }
+            var n = 0;
+            if (arguments.length > 1) {
+              n = Number(arguments[1]);
+              if (n != n) { // shortcut for verifying if it's NaN
+                n = 0;
+              } else if (n !== 0 && n !== Infinity && n !== -Infinity) {
+                n = (n > 0 || -1) * Math.floor(Math.abs(n));
+              }
+            }
+            if (n >= len) {
+              return -1;
+            }
+            var k = n >= 0 ? n : Math.max(len - Math.abs(n), 0);
+            for (; k < len; k++) {
+              if (k in t && t[k] === searchElement) {
+                return k;
+              }
+            }
+            return -1;
+          };
+        }
+
       }
     };
   }
 ]);
-
 /**
  * Add a clear button to form inputs to reset their value
  */
@@ -789,6 +1135,7 @@ angular.module('ui.directives').directive('uiReset', ['ui.config', function (uiC
 angular.module('ui.directives').directive('uiRoute', ['$location', '$parse', function ($location, $parse) {
   return {
     restrict: 'AC',
+    scope: true,
     compile: function(tElement, tAttrs) {
       var useProperty;
       if (tAttrs.uiRoute) {
@@ -939,21 +1286,23 @@ angular.module('ui.directives').directive('uiSelect2', ['ui.config', '$timeout',
           // Watch the model for programmatic changes
           controller.$render = function () {
             if (isSelect) {
-              elm.select2('val', controller.$modelValue);
+              elm.select2('val', controller.$viewValue);
             } else {
               if (isMultiple) {
-                if (!controller.$modelValue) {
+                if (!controller.$viewValue) {
                   elm.select2('data', []);
-                } else if (angular.isArray(controller.$modelValue)) {
-                  elm.select2('data', controller.$modelValue);
+                } else if (angular.isArray(controller.$viewValue)) {
+                  elm.select2('data', controller.$viewValue);
                 } else {
-                  elm.select2('val', controller.$modelValue);
+                  elm.select2('val', controller.$viewValue);
                 }
               } else {
-                if (angular.isObject(controller.$modelValue)) {
-                  elm.select2('data', controller.$modelValue);
+                if (angular.isObject(controller.$viewValue)) {
+                  elm.select2('data', controller.$viewValue);
+                } else if (!controller.$viewValue) {
+                  elm.select2('data', null);
                 } else {
-                  elm.select2('val', controller.$modelValue);
+                  elm.select2('val', controller.$viewValue);
                 }
               }
             }
@@ -1003,11 +1352,17 @@ angular.module('ui.directives').directive('uiSelect2', ['ui.config', '$timeout',
         }
 
         // Set initial value since Angular doesn't
-        elm.val(scope.$eval(attrs.ngModel));
+        //elm.val(scope.$eval(attrs.ngModel));
 
         // Initialize the plugin late so that the injected DOM does not disrupt the template compiler
         $timeout(function () {
           elm.select2(opts);
+
+          // Set initial value - I'm not sure about this but it seems to need to be there
+          elm.val(controller.$viewValue);
+          // important!
+          controller.$render();
+
           // Not sure if I should just check for !isSelect OR if I should check for 'tags' key
           if (!opts.initSelection && !isSelect)
             controller.$setViewValue(elm.select2('data'));
@@ -1088,7 +1443,7 @@ angular.module('ui.directives').directive('uiSortable', [
     return {
       require: '?ngModel',
       link: function(scope, element, attrs, ngModel) {
-        var onReceive, onRemove, onStart, onUpdate, opts, _receive, _remove, _start, _update;
+        var onReceive, onRemove, onStart, onUpdate, opts;
 
         opts = angular.extend({}, uiConfig.sortable, scope.$eval(attrs.uiSortable));
 
@@ -1131,8 +1486,6 @@ angular.module('ui.directives').directive('uiSortable', [
               var end, start;
               start = ui.item.sortable.index;
               end = ui.item.index();
-              if (start < end)
-                end--;
 
               // Reorder array and apply change to scope
               ui.item.sortable.resort.$modelValue.splice(end, 0, ui.item.sortable.resort.$modelValue.splice(start, 1)[0]);
@@ -1144,44 +1497,49 @@ angular.module('ui.directives').directive('uiSortable', [
           };
 
           // If user provided 'start' callback compose it with onStart function
-          _start = opts.start;
-          opts.start = function(e, ui) {
-            onStart(e, ui);
-            if (typeof _start === "function")
-              _start(e, ui);
-          };
+          opts.start = (function(_start){
+            return function(e, ui) {
+              onStart(e, ui);
+              if (typeof _start === "function")
+                _start(e, ui);
+            }
+          })(opts.start);
 
           // If user provided 'start' callback compose it with onStart function
-          _stop = opts.stop;
-          opts.stop = function(e, ui) {
-            onStop(e, ui);
-            if (typeof _stop === "function")
-              _stop(e, ui);
-          };
+          opts.stop = (function(_stop){
+            return function(e, ui) {
+              onStop(e, ui);
+              if (typeof _stop === "function")
+                _stop(e, ui);
+            }
+          })(opts.stop);
 
           // If user provided 'update' callback compose it with onUpdate function
-          _update = opts.update;
-          opts.update = function(e, ui) {
-            onUpdate(e, ui);
-            if (typeof _update === "function")
-              _update(e, ui);
-          };
+          opts.update = (function(_update){
+            return function(e, ui) {
+              onUpdate(e, ui);
+              if (typeof _update === "function")
+                _update(e, ui);
+            }
+          })(opts.update);
 
           // If user provided 'receive' callback compose it with onReceive function
-          _receive = opts.receive;
-          opts.receive = function(e, ui) {
-            onReceive(e, ui);
-            if (typeof _receive === "function")
-              _receive(e, ui);
-          };
+          opts.receive = (function(_receive){
+            return function(e, ui) {
+              onReceive(e, ui);
+              if (typeof _receive === "function")
+                _receive(e, ui);
+            }
+          })(opts.receive);
 
           // If user provided 'remove' callback compose it with onRemove function
-          _remove = opts.remove;
-          opts.remove = function(e, ui) {
-            onRemove(e, ui);
-            if (typeof _remove === "function")
-              _remove(e, ui);
-          };
+          opts.remove = (function(_remove){
+            return function(e, ui) {
+              onRemove(e, ui);
+              if (typeof _remove === "function")
+                _remove(e, ui);
+            };
+          })(opts.remove);
         }
 
         // Create sortable
